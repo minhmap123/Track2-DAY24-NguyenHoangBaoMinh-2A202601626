@@ -30,10 +30,58 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?![\w-])")
+_BANK_RE = re.compile(
+    r"(?i)(?:\bstk\b|s(?:ố|o)\s*t(?:à|a)i\s*kho(?:ả|a)n)\s*[:#-]?\s*(\d{8,16})(?!\d)"
+)
+_CCCD_LABEL_RE = re.compile(
+    r"(?i)(?:\bcccd\b|c(?:ă|a)n\s*c(?:ư|u)(?:ớ|o)c)\D{0,20}(\d{12})(?!\d)"
+)
+_TWELVE_DIGIT_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
+_PHONE_RE = re.compile(r"(?<!\d)(0\d(?:[ .-]?\d){8,9})(?!\d)")
+
+
+def _span(match: re.Match[str], entity_type: str, group: int = 0) -> dict:
+    return {"type": entity_type, "start": match.start(group), "end": match.end(group)}
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    """Return deterministic regex matches with offsets into the original text.
+
+    Account numbers are recognised from their banking label before generic
+    12-digit IDs, preventing an STK with 12 digits from being mislabeled CCCD.
+    """
+    entities: list[dict] = []
+    occupied: list[tuple[int, int]] = []
+
+    def add(match: re.Match[str], entity_type: str, group: int = 0) -> None:
+        start, end = match.span(group)
+        if start == -1 or any(start < other_end and other_start < end for other_start, other_end in occupied):
+            return
+        entities.append(_span(match, entity_type, group))
+        occupied.append((start, end))
+
+    for match in _EMAIL_RE.finditer(text):
+        add(match, "EMAIL")
+    for match in _BANK_RE.finditer(text):
+        add(match, "VN_BANK_ACCOUNT", 1)
+    for match in _CCCD_LABEL_RE.finditer(text):
+        add(match, "VN_CCCD", 1)
+    for match in _TWELVE_DIGIT_RE.finditer(text):
+        add(match, "VN_CCCD", 1)
+    for match in _PHONE_RE.finditer(text):
+        add(match, "VN_PHONE", 1)
+
+    return sorted(entities, key=lambda entity: (entity["start"], entity["end"], entity["type"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    redacted = text
+    # Right-to-left replacement preserves offsets obtained from the original.
+    for entity in sorted(detect(text), key=lambda item: item["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        redacted = redacted[: entity["start"]] + replacement + redacted[entity["end"] :]
+    return redacted
