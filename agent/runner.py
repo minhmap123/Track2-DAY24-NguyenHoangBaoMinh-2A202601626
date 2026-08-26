@@ -53,11 +53,104 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
+_TICKET_ID_RE = re.compile(r"^ticket-(\d+)\.md$")
+_ALLOWED_EGRESS = ("localhost", 9999)
+
+
+def _args_hash(args: object) -> str:
+    encoded = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _trusted_customers_for_tickets(ticket_ids: set[int]) -> list[str]:
+    """Map file-derived ticket IDs to customers using only the trusted store."""
+    records = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    return [
+        str(record["customer_id"])
+        for record in records
+        if ticket_ids.intersection({int(ticket) for ticket in record.get("related_tickets", [])})
+    ]
+
+
+def _is_allowlisted(url: str) -> bool:
+    parsed = urlparse(url)
+    return (parsed.hostname, parsed.port) == _ALLOWED_EGRESS
+
+
+def _record_decision(
+    ledger_path: Path, run_id: str, tool: str, args: object, classification: str,
+    allow: bool, reason: str,
+) -> None:
+    ledger.append(
+        {
+            "ts": datetime.now(UTC).isoformat(),
+            "agent_id": "lab24-governed-agent",
+            "run_id": run_id,
+            "tool": tool,
+            "args_hash": _args_hash(args),
+            "classification": classification,
+            "decision": "allow" if allow else "deny",
+            "reason": reason or "deny: policy returned no reason",
+        },
+        ledger_path,
+    )
+
 
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    """Execute separate untrusted and private-data runs with a PEP on each tool."""
+    ledger_path = (log_dir / "ledger.jsonl") if log_dir is not None else DEFAULT_LEDGER_PATH
+    run_id = hashlib.sha256(f"{datetime.now(UTC).isoformat()}:{message}".encode()).hexdigest()[:16]
+
+    # Run A: it may read only untrusted documents, never private data or egress.
+    search_context = policy.PolicyContext("internal", "summarize-tickets", "run-a", 0, False)
+    allow, reason = policy.check(search_context)
+    _record_decision(ledger_path, run_id, "search_docs", {"query": message}, "internal", allow, reason)
+    if not allow:
+        return "Yêu cầu bị chặn bởi policy trước khi tìm ticket."
+    raw_docs = tools.search_docs(message)
+
+    # Only typed identifiers extracted from filenames cross the A/B boundary.
+    ticket_ids = {
+        int(match.group(1))
+        for document in raw_docs
+        if (match := _TICKET_ID_RE.match(str(document["id"])))
+    }
+    safe_docs = [{"id": doc["id"], "text": pii.redact(str(doc["text"]))} for doc in raw_docs]
+    injected = llm.find_injection("\n\n".join(doc["text"] for doc in safe_docs))
+
+    # Run B: customer IDs are obtained exclusively from related_tickets, never lure text.
+    for customer_id in _trusted_customers_for_tickets(ticket_ids):
+        read_context = policy.PolicyContext("restricted", "ticket-reconciliation", "run-b", 1, False)
+        allow, reason = policy.check(read_context)
+        _record_decision(ledger_path, run_id, "read_customer", {"customer_id": customer_id}, "restricted", allow, reason)
+        if allow:
+            tools.read_customer(customer_id)
+
+    # An injection may request egress, but the PEP blocks restricted data before any POST.
+    if injected is not None:
+        target_url = injected.target_url
+        if not _is_allowlisted(target_url):
+            allow, reason = False, "deny: egress URL is not on the runner allowlist"
+        else:
+            egress_context = policy.PolicyContext("restricted", "injection-request", "run-b", 1, True)
+            allow, reason = policy.check(egress_context)
+        _record_decision(
+            ledger_path, run_id, "http_post", {"url": target_url}, "restricted", allow, reason
+        )
+        if allow:
+            # This branch is deliberately unreachable under the mandatory restricted-egress rule.
+            tools.http_post(target_url, {"records": []})
+
+    return llm.summarize(safe_docs)
