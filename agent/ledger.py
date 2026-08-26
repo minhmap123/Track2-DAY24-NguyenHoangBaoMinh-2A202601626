@@ -33,12 +33,67 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_GENESIS_HASH = "0" * 64
+_REQUIRED_FIELDS = {
+    "ts", "agent_id", "run_id", "tool", "args_hash", "classification", "decision", "reason"
+}
+
+
+def _hash_entry(entry: dict) -> str:
+    payload = {key: value for key, value in entry.items() if key != "hash"}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _previous_hash(path: Path) -> str:
+    if not path.exists() or not path.read_text(encoding="utf-8").strip():
+        return _GENESIS_HASH
+    try:
+        last_line = path.read_text(encoding="utf-8").splitlines()[-1]
+        return str(json.loads(last_line)["hash"])
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        # Preserve evidence of a broken chain rather than silently restarting it.
+        return "INVALID_PREVIOUS_LEDGER" 
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    missing = _REQUIRED_FIELDS.difference(entry)
+    if missing:
+        raise ValueError(f"ledger entry missing required fields: {sorted(missing)}")
+
+    written = dict(entry)
+    written.pop("hash", None)
+    written["prev_hash"] = _previous_hash(path)
+    written["hash"] = _hash_entry(written)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(written, ensure_ascii=False, sort_keys=True) + "\n")
+    return written
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    if not path.exists():
+        return True
+
+    expected_previous = _GENESIS_HASH
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            if not line.strip():
+                return False
+            entry = json.loads(line)
+            if not _REQUIRED_FIELDS.issubset(entry) or not entry.get("reason"):
+                return False
+            if entry.get("prev_hash") != expected_previous or not entry.get("hash"):
+                return False
+            if entry["hash"] != _hash_entry(entry):
+                return False
+            expected_previous = entry["hash"]
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    return True
