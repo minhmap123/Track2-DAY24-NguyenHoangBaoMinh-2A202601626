@@ -56,7 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -91,13 +91,15 @@ def _is_allowlisted(url: str) -> bool:
 
 def _record_decision(
     ledger_path: Path, run_id: str, tool: str, args: object, classification: str,
-    allow: bool, reason: str,
+    allow: bool, reason: str, agent_owner: str, expires_at: str,
 ) -> None:
     ledger.append(
         {
             "ts": datetime.now(UTC).isoformat(),
             "agent_id": "lab24-governed-agent",
+            "agent_owner": agent_owner,
             "run_id": run_id,
+            "expires_at": expires_at,
             "tool": tool,
             "args_hash": _args_hash(args),
             "classification": classification,
@@ -111,12 +113,16 @@ def _record_decision(
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
     """Execute separate untrusted and private-data runs with a PEP on each tool."""
     ledger_path = (log_dir / "ledger.jsonl") if log_dir is not None else DEFAULT_LEDGER_PATH
-    run_id = hashlib.sha256(f"{datetime.now(UTC).isoformat()}:{message}".encode()).hexdigest()[:16]
+    started_at = datetime.now(UTC)
+    run_id = hashlib.sha256(f"{started_at.isoformat()}:{message}".encode()).hexdigest()[:16]
+    expires_at = (started_at + timedelta(minutes=5)).isoformat()
 
     # Run A: it may read only untrusted documents, never private data or egress.
     search_context = policy.PolicyContext("internal", "summarize-tickets", "run-a", 0, False)
     allow, reason = policy.check(search_context)
-    _record_decision(ledger_path, run_id, "search_docs", {"query": message}, "internal", allow, reason)
+    _record_decision(
+        ledger_path, run_id, "search_docs", {"query": message}, "internal", allow, reason, "run-a", expires_at
+    )
     if not allow:
         return "Yêu cầu bị chặn bởi policy trước khi tìm ticket."
     raw_docs = tools.search_docs(message)
@@ -134,7 +140,9 @@ def handle(message: str, llm, log_dir: Path | None = None) -> str:
     for customer_id in _trusted_customers_for_tickets(ticket_ids):
         read_context = policy.PolicyContext("restricted", "ticket-reconciliation", "run-b", 1, False)
         allow, reason = policy.check(read_context)
-        _record_decision(ledger_path, run_id, "read_customer", {"customer_id": customer_id}, "restricted", allow, reason)
+        _record_decision(
+            ledger_path, run_id, "read_customer", {"customer_id": customer_id}, "restricted", allow, reason, "run-b", expires_at
+        )
         if allow:
             tools.read_customer(customer_id)
 
@@ -147,7 +155,7 @@ def handle(message: str, llm, log_dir: Path | None = None) -> str:
             egress_context = policy.PolicyContext("restricted", "injection-request", "run-b", 1, True)
             allow, reason = policy.check(egress_context)
         _record_decision(
-            ledger_path, run_id, "http_post", {"url": target_url}, "restricted", allow, reason
+            ledger_path, run_id, "http_post", {"url": target_url}, "restricted", allow, reason, "run-b", expires_at
         )
         if allow:
             # This branch is deliberately unreachable under the mandatory restricted-egress rule.
