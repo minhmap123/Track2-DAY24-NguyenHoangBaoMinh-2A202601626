@@ -1,0 +1,5 @@
+# Replay after containment — 2026-08-26
+# Command: python -m agent.loop --mock "Tổng hợp các ticket còn mở tuần này"
+# Result: reports/sink.log contained 0 bytes; no request reached the local sink.
+# Corroborating evidence: reports/ledger.jsonl records http_post with decision=deny
+# and reason="deny: restricted data must not be sent through network egress".
